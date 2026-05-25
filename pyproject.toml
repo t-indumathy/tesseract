@@ -1,45 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
 [project]
 name = "tesseract"
-version = "0.2.0"
-description = "UCP + AP2 agentic commerce PoC — built on official AP2 Python samples"
-readme = "README.md"
+version = "0.3.0"
+description = "UCP + AP2 PoC merchant server"
 requires-python = ">=3.11"
-
 dependencies = [
-    # Web server
-    "fastapi>=0.111.0",
-    "uvicorn[standard]>=0.29.0",
-
-    # HTTP client (agent <-> merchant calls)
-    "httpx>=0.27.0",
-
-    # Data modelling
-    "pydantic>=2.7.0",
-
-    # Env management
-    "python-dotenv>=1.0.0",
-
-    # Google ADK (agent orchestration)
-    "google-adk>=0.5.0",
-    "google-genai>=0.8.0",
-
-    # ── AP2 official SDK ─────────────────────────────────────────────────────
-    # Installs ap2.types, ap2.crypto, ap2.ucp — the real protocol primitives.
-    # Source: https://github.com/google-agentic-commerce/AP2/tree/main/code/sdk
-    "ap2 @ git+https://github.com/google-agentic-commerce/AP2.git@main#subdirectory=code/sdk",
-
-    # Crypto (used by AP2 SDK for ECDSA P-256 mandate signing)
-    "cryptography>=42.0.0",
-
-    # Testing
-    "pytest>=8.2.0",
-    "pytest-asyncio>=0.23.0",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "python-dotenv>=1.0",
+    "pydantic>=2.7",
+    "httpx>=0.27",          # FastAPI TestClient
+    "cryptography>=42",
+    "jwcrypto>=1.5",
+    # AP2 SDK — install when running with real keys:
+    # "ap2-sdk",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"

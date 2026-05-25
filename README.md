@@ -1,118 +1,140 @@
-# Tesseract — UCP + AP2 Agentic Commerce PoC
+# Tesseract — UCP + AP2 PoC
 
-A minimal working proof-of-concept demonstrating **Universal Commerce Protocol (UCP)** + **Agent Payments Protocol (AP2)** flowing end-to-end through a simulated AI shopping agent.
+A working end-to-end proof-of-concept for the
+[Universal Checkout Protocol (UCP)](https://ucp.dev/2026-04-08/specification/overview/)
+and
+[Agent Payments Protocol v2 (AP2)](https://github.com/google-agentic-commerce/AP2).
 
-## What This PoC Demonstrates
+Built on the official AP2 sample role pattern
+([`merchant_agent`](https://github.com/google-agentic-commerce/AP2/tree/main/code/samples/python/src/roles/merchant_agent) +
+[`credentials_provider_agent`](https://github.com/google-agentic-commerce/AP2/tree/main/code/samples/python/src/roles/credentials_provider_agent)).
+
+---
+
+## Architecture
 
 ```
-User → Shopping Agent (ADK / Gemini) → UCP Merchant Server → AP2 Payment Flow
-                                               ↕
-                                    Cart Mandate (VC)
-                                    Intent Mandate (VC)
+ Shopping Agent (buyer)
+        │
+        │  1. GET /.well-known/ucp          ← capability discovery
+        │  2. POST /ucp/catalog/search       ← product search
+        │  3. POST /ucp/cart                 ← cart creation
+        │  4. POST /ucp/checkout             ← AP2 mandate verification
+        │  5. GET  /ucp/order/{id}           ← order status
+        ▼
+  ┌────────────────────────────────┐
+  │  Tesseract Merchant Server           │
+  │  src/merchant/server.py (FastAPI)    │
+  │  └ UCP-Version header on all routes  │
+  │  └ Reverse-domain capability names   │
+  └────────────────────────────────┘
+        │
+        ▼
+  ┌────────────────────────────────┐
+  │  AP2 Mandate Layer                   │
+  │  src/ap2/mandate_verifier.py         │
+  │  └ MandateClient().verify()          │
+  │  └ HNP (single-token SD-JWT)         │
+  │  └ DPC chain ("~~" split, X5c/kid)   │
+  │  └ Stub mode when ap2-sdk absent     │
+  └────────────────────────────────┘
 ```
-
-1. **Discovery** — Agent queries the UCP merchant's capability manifest
-2. **Cart Building** — Agent selects a product and builds a cart
-3. **AP2 Intent Mandate** — User confirms intent; a Verifiable Credential is issued
-4. **AP2 Cart Mandate** — Cart details are cryptographically signed
-5. **Checkout** — UCP merchant processes the order referencing the AP2 mandates
-6. **Order Confirmation** — Non-repudiable, auditable transaction record
 
 ## Project Structure
 
 ```
 tesseract/
-├── README.md
-├── .env.example               # Required env vars
-├── pyproject.toml             # uv-compatible project manifest
 ├── src/
-│   ├── merchant/              # UCP Merchant Server (FastAPI)
-│   │   ├── __init__.py
-│   │   ├── server.py          # UCP REST endpoints
-│   │   ├── catalog.py         # Mock product catalog
-│   │   └── models.py          # UCP Pydantic models
-│   ├── agent/                 # Shopping Agent (Google ADK)
-│   │   ├── __init__.py
-│   │   ├── shopping_agent.py  # Main agent entrypoint
-│   │   └── tools.py           # UCP + AP2 tool bindings
-│   └── ap2/                   # AP2 mandate handling
-│       ├── __init__.py
-│       ├── mandates.py        # Intent & Cart Mandate issuance
-│       └── verifier.py        # VC verification logic
-├── scenarios/
-│   └── buy_item/
-│       ├── README.md
-│       └── run.sh
-└── tests/
-    ├── test_ucp_merchant.py
-    └── test_ap2_mandates.py
+│   ├── merchant/
+│   │   ├── server.py          # FastAPI app — UCP-compliant routes
+│   │   ├── catalog.py         # Mock product catalog (5 SKUs)
+│   │   ├── storage.py         # In-memory cart + order store
+│   │   └── ucp_manifest.py    # UCP capability manifest builder
+│   └── ap2/
+│       ├── mandate_verifier.py # MandateClient wrapper (HNP + DPC)
+│       └── credentials.py      # Stub account/token store
+├── tests/
+│   └── test_e2e_ucp_ap2.py    # End-to-end pytest suite
+├── pyproject.toml
+└── README.md
 ```
 
-## Quickstart
-
-### Prerequisites
-- Python 3.10+
-- [`uv`](https://github.com/astral-sh/uv) package manager
-- Google API key (from [AI Studio](https://aistudio.google.com/))
-
-### Setup
+## Quick Start
 
 ```bash
-# 1. Clone and enter the repo
-git clone https://github.com/t-indumathy/tesseract.git
-cd tesseract
+# 1. Install
+pip install -e ".[dev]"
 
-# 2. Copy and fill in env vars
-cp .env.example .env
-# edit .env with your GOOGLE_API_KEY
+# 2. Run the server
+python -m src.merchant.server
+# → http://localhost:8080
 
-# 3. Install dependencies
-uv sync
-
-# 4. Run the merchant server (terminal 1)
-uv run uvicorn src.merchant.server:app --reload --port 8080
-
-# 5. Run the shopping agent (terminal 2)
-uv run python src/agent/shopping_agent.py
+# 3. Run the test suite
+pytest tests/ -v
 ```
 
-### Run the full buy_item scenario
+## Key Endpoints
 
-```bash
-bash scenarios/buy_item/run.sh
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/.well-known/ucp` | UCP capability manifest |
+| `POST` | `/ucp/catalog/search` | Keyword product search |
+| `POST` | `/ucp/cart` | Create cart + compute tax |
+| `POST` | `/ucp/checkout` | AP2 mandate verification + order confirm |
+| `GET` | `/ucp/order/{id}` | Order status |
+
+## AP2 Mandate Flows
+
+The checkout endpoint supports both AP2 flows from the official sample:
+
+### HNP (Hosted Network Payment — standard)
+```json
+{
+  "cart_id": "<cart_id>",
+  "checkout_mandate_sdjwt": "<CheckoutMandate SD-JWT>",
+  "payment_mandate_sdjwt":  "<PaymentMandate SD-JWT>"
+}
 ```
 
-## Protocol Flow (Detailed)
+### DPC (Digital Payment Credential — wallet-bound)
+Same shape. The `~~` separator in the SD-JWT string triggers the
+three-level delegation path: `DPC cnf → wallet key → KB-SD-JWT cnf → agent key → agent KB-JWT`.
 
-### UCP Side
+### PoC Fallback (no ap2-sdk)
+```json
+{
+  "cart_id": "<cart_id>",
+  "intent_mandate": { "action": "purchase" },
+  "cart_mandate":   { "authorized_total_usd": 200.0 }
+}
+```
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/.well-known/ucp-manifest` | GET | Capability discovery |
-| `/ucp/catalog/search` | POST | Product search |
-| `/ucp/cart` | POST | Create cart |
-| `/ucp/checkout` | POST | Initiate checkout |
-| `/ucp/order/{id}` | GET | Order status |
+## Spec Compliance Notes
 
-### AP2 Side
+| Requirement | Implementation |
+|-------------|----------------|
+| Manifest at `/.well-known/ucp` | ✅ `server.py` |
+| `UCP-Version` header on all responses | ✅ `_ucp_headers()` |
+| Reverse-domain capability names | ✅ `ucp_manifest.py` |
+| `UCP-Agent` header echoed in manifest | ✅ `ucp_manifest.build_manifest()` |
+| AP2 HNP single-token verification | ✅ `mandate_verifier.verify_*()` |
+| AP2 DPC chain verification (`~~`) | ✅ `mandate_verifier.verify_*()` |
+| Graceful stub when ap2-sdk absent | ✅ `_AP2_AVAILABLE` guard |
 
-| Object | Role |
-|---|---|
-| **Intent Mandate (VC)** | Cryptographically-signed user intent — proves the user authorised the agent to act |
-| **Cart Mandate (VC)** | Signed cart snapshot — non-repudiable record of what was purchased and at what price |
+## Environment Variables
 
-AP2 mandates are issued as [W3C Verifiable Credentials](https://www.w3.org/TR/vc-data-model/) and verified by the merchant before processing checkout.
-
-## Key Design Decisions
-
-- **Mock Verifiable Credentials** — real VC signing uses `cryptography` lib with ECDSA P-256; this PoC uses a simplified HMAC-based substitute so you don't need a DID/wallet setup
-- **Stateless merchant server** — in-memory order store; swap with any DB for production
-- **Agent framework** — uses Google ADK with Gemini 2.5 Flash; swap the LLM or framework freely since AP2/UCP are protocol-agnostic
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_PROVIDER_PUBLIC_KEY_PATH` | `` | Path to agent-provider public key PEM |
+| `MERCHANT_SIGNING_KEY_PATH` | `` | Path to merchant EC private key PEM |
+| `AP2_CERTS_DIR` | `certs/` | Directory containing `issuer_cert_sdjwt.pem` |
+| `MERCHANT_AUD` | `https://merchant.com` | Expected audience in CheckoutMandate |
+| `MERCHANT_NONCE` | `merchant-nonce-xyz` | Expected nonce in CheckoutMandate |
+| `MERCHANT_BASE_URL` | `http://localhost:8080` | Base URL for capability endpoints |
 
 ## References
 
-- [UCP Specification](https://ucp.dev)
-- [UCP GitHub](https://github.com/universal-commerce-protocol/ucp)
-- [AP2 GitHub](https://github.com/google-agentic-commerce/AP2)
-- [Google UCP Developer Guide](https://developers.google.com/merchant/ucp)
-- [AP2 Cloud Blog](https://cloud.google.com/blog/products/ai-machine-learning/announcing-agents-to-payments-ap2-protocol)
+- [UCP Specification 2026-04-08](https://ucp.dev/2026-04-08/specification/overview/)
+- [AP2 GitHub (Apache-2.0)](https://github.com/google-agentic-commerce/AP2)
+- [AP2 merchant_agent sample](https://github.com/google-agentic-commerce/AP2/tree/main/code/samples/python/src/roles/merchant_agent)
+- [AP2 credentials_provider_agent sample](https://github.com/google-agentic-commerce/AP2/tree/main/code/samples/python/src/roles/credentials_provider_agent)
