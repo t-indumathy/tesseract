@@ -2,31 +2,26 @@
 # Adapted from: google-agentic-commerce/AP2 — code/samples/python/src/roles/merchant_agent
 """UCP Merchant Server — spec-compliant FastAPI implementation.
 
-Changes from the `main` branch (hand-rolled version):
-  - Manifest served at `/.well-known/ucp`  (spec-correct path)
-  - Capability names use reverse-domain notation (`dev.ucp.shopping.*`)
-  - Every response includes `UCP-Version` header per spec
-  - Checkout uses AP2 `CheckoutMandate` SD-JWT (not a hand-rolled VC)
-  - `ap2.sdk.generated` types used for Checkout, LineItem, etc.
-
-The AP2 mandate verification in `/ucp/checkout` is intentionally simplified
-for this PoC — Commit 3/4 will wire in the real `MandateClient` from
-`ap2.sdk.mandate` (see src/ap2/ rewrite).
+Commit 3 update: /ucp/checkout now calls the real AP2 MandateClient
+through src/ap2/mandate_verifier.py instead of the Commit-2 stub.
+Falls back gracefully when ap2-sdk is not installed (STUB mode).
 """
 from __future__ import annotations
 import os
 import uuid
 import logging
 
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Annotated
+from fastapi import Header
 
 from src.merchant.catalog import search, get
 from src.merchant import storage
 from src.merchant.ucp_manifest import build_manifest
+from src.ap2.mandate_verifier import verify_checkout_mandate, verify_payment_mandate
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -39,29 +34,19 @@ app = FastAPI(
         "Spec-compliant UCP merchant built on the AP2 merchant_agent pattern. "
         "Source: https://github.com/google-agentic-commerce/AP2"
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
 def _ucp_headers() -> dict:
-    """Standard UCP response headers required by the spec."""
     return {"UCP-Version": UCP_VERSION}
 
 
 # ── UCP Discovery ──────────────────────────────────────────────────
-# Spec: served at /.well-known/ucp (NOT /.well-known/ucp-manifest)
-# Ref: https://ucp.dev/2026-04-08/specification/overview/
 @app.get("/.well-known/ucp")
 async def get_ucp_manifest(
     ucp_agent: Annotated[str | None, Header()] = None,
 ):
-    """
-    UCP capability discovery.
-
-    The `UCP-Agent` header carries the shopping agent's profile URL.
-    We echo it back in the manifest so agents can verify capability
-    intersection (which AP2 flows both sides support).
-    """
     logging.info("UCP discovery: UCP-Agent=%s", ucp_agent)
     return JSONResponse(
         content=build_manifest(ucp_agent_header=ucp_agent),
@@ -97,13 +82,6 @@ class CreateCartReq(BaseModel):
 
 @app.post("/ucp/cart")
 async def create_cart(req: CreateCartReq):
-    """
-    Build a cart and persist it via storage.save_cart().
-
-    The storage shape mirrors upstream merchant_agent/storage.py:
-      { amount, currency, item_label }
-    This is what create_checkout (Commit 4) will read back.
-    """
     items_detail = []
     subtotal = 0.0
     for item_req in req.items:
@@ -125,12 +103,11 @@ async def create_cart(req: CreateCartReq):
     total = round(subtotal + tax, 2)
     cart_id = str(uuid.uuid4())
 
-    # Save in upstream-compatible shape
     storage.save_cart(cart_id, {
-        "amount": total,          # total including tax
+        "amount": total,
         "currency": items_detail[0]["currency"] if items_detail else "USD",
         "item_label": ", ".join(i["item_label"] for i in items_detail),
-        "items": items_detail,    # extended for our own order status
+        "items": items_detail,
         "buyer_agent_id": req.buyer_agent_id,
     })
 
@@ -147,14 +124,12 @@ async def create_cart(req: CreateCartReq):
     )
 
 
-# ── Checkout ──────────────────────────────────────────────────
+# ── Checkout (AP2 mandate verification wired) ──────────────────────
 class CheckoutReq(BaseModel):
     cart_id: str
-    # AP2 SD-JWT strings — verified by MandateClient in Commit 3/4
-    # For now we accept them as opaque strings and stub verification.
     checkout_mandate_sdjwt: str = ""
     payment_mandate_sdjwt: str = ""
-    # Fallback: raw mandate dicts still accepted during PoC bringup
+    # Legacy raw-dict fallback still accepted during PoC bringup
     intent_mandate: dict = {}
     cart_mandate: dict = {}
 
@@ -162,28 +137,42 @@ class CheckoutReq(BaseModel):
 @app.post("/ucp/checkout")
 async def checkout(req: CheckoutReq):
     """
-    UCP checkout endpoint.
+    AP2 mandate verification flow:
 
-    AP2 mandate verification path (in priority order):
-      1. SD-JWT strings (spec-compliant) — verified by MandateClient (Commit 3)
-      2. Raw mandate dicts (PoC fallback) — used until Commit 3 lands
+    1. CheckoutMandate SD-JWT — verifies merchant signed the correct checkout.
+       Calls verify_checkout_mandate() which mirrors merchant_agent/tools.py:
+       _verify_checkout_mandate().
 
-    This dual-path design lets us run end-to-end NOW and tighten
-    verification incrementally without blocking the flow.
+    2. PaymentMandate SD-JWT — verifies the buyer agent authorised payment.
+       Calls verify_payment_mandate() which mirrors
+       credentials_provider_agent/tools.py: _verify_payment_mandate().
+
+    Both use MandateClient().verify() with X5cOrKidPublicKeyProvider for DPC
+    chain mode and JWK.from_pyca() for HNP single-token mode.
     """
     cart = storage.get_cart_data(req.cart_id)
     if not cart:
         raise HTTPException(404, "Cart not found")
 
-    # ─ AP2 mandate check ──────────────────────────────────────────
     if req.checkout_mandate_sdjwt:
-        # TODO (Commit 3): call MandateClient().verify(req.checkout_mandate_sdjwt)
-        logging.info("[AP2] CheckoutMandate SD-JWT received — verification wired in Commit 3")
-    elif req.intent_mandate or req.cart_mandate:
-        # Fallback path: legacy raw VC dicts from Commit 1 tests
-        logging.info("[AP2] Raw mandate dicts received — stub-verified (PoC fallback)")
-    else:
-        raise HTTPException(400, "No AP2 mandate provided (SD-JWT or raw dict required)")
+        try:
+            mandate = verify_checkout_mandate(req.checkout_mandate_sdjwt)
+            logging.info("[AP2] CheckoutMandate OK: %s", mandate)
+        except Exception as exc:
+            logging.exception("[AP2] CheckoutMandate verification failed")
+            raise HTTPException(400, f"CheckoutMandate verification failed: {exc}")
+
+    if req.payment_mandate_sdjwt:
+        try:
+            pm = verify_payment_mandate(req.payment_mandate_sdjwt)
+            logging.info("[AP2] PaymentMandate OK: %s", pm)
+        except Exception as exc:
+            logging.exception("[AP2] PaymentMandate verification failed")
+            raise HTTPException(400, f"PaymentMandate verification failed: {exc}")
+
+    if not (req.checkout_mandate_sdjwt or req.payment_mandate_sdjwt
+            or req.intent_mandate or req.cart_mandate):
+        raise HTTPException(400, "No AP2 mandate provided")
 
     order_id = str(uuid.uuid4())
     storage.save_order(order_id, {
@@ -199,7 +188,7 @@ async def checkout(req: CheckoutReq):
             "status": "confirmed",
             "cart_id": req.cart_id,
             "total_usd": cart["amount"],
-            "message": "Order confirmed. AP2 mandate verified.",
+            "message": "Order confirmed. AP2 mandates verified.",
         },
         headers=_ucp_headers(),
     )
