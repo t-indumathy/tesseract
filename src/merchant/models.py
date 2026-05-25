@@ -1,27 +1,77 @@
-"""UCP Pydantic models — aligned with UCP specification primitives."""
+"""Pydantic models shaped exactly to the UCP 2026-04-08 spec.
+
+Key spec refs:
+  - Profile: https://ucp.dev/2026-04-08/specification/overview/#profile-structure
+  - Checkout: https://ucp.dev/2026-04-08/specification/checkout
+  - Capability names: reverse-domain format, e.g. dev.ucp.shopping.checkout
+"""
 from __future__ import annotations
 from typing import Any
 from pydantic import BaseModel, Field
 import uuid
 
 
-# ── Capability Manifest ────────────────────────────────────────
-class UCPCapability(BaseModel):
-    name: str
-    version: str
-    supported: bool = True
+# ---------------------------------------------------------------------------
+# UCP Profile (/.well-known/ucp)
+# Ref: https://ucp.dev/2026-04-08/specification/overview/#business-profile
+# ---------------------------------------------------------------------------
+
+class UCPServiceBinding(BaseModel):
+    """Single transport binding for a service."""
+    version: str = "2026-04-08"
+    spec: str
+    transport: str  # "rest" | "mcp" | "a2a" | "embedded"
+    endpoint: str | None = None
+    schema_url: str | None = Field(None, alias="schema")
+
+    model_config = {"populate_by_name": True}
 
 
-class UCPManifest(BaseModel):
-    merchant_id: str
-    merchant_name: str
-    ucp_version: str = "1.0"
-    capabilities: list[UCPCapability]
-    checkout_url: str
-    ap2_supported: bool = True
+class UCPCapabilityEntry(BaseModel):
+    """Single capability version entry in the profile."""
+    version: str = "2026-04-08"
+    spec: str
+    schema_url: str = Field(alias="schema")
+    extends: str | list[str] | None = None
+    config: dict[str, Any] | None = None
+
+    model_config = {"populate_by_name": True}
 
 
-# ── Catalog ────────────────────────────────────────────────────
+class UCPProfile(BaseModel):
+    """The full /.well-known/ucp response."""
+    ucp: UCPProfileBody
+
+
+class UCPProfileBody(BaseModel):
+    version: str = "2026-04-08"
+    # service name → list of transport bindings
+    services: dict[str, list[UCPServiceBinding]]
+    # capability name → list of UCPCapabilityEntry
+    capabilities: dict[str, list[UCPCapabilityEntry]]
+    payment_handlers: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# UCP Response envelope — every response MUST carry this
+# Ref: https://ucp.dev/2026-04-08/specification/overview/#capability-declaration-in-responses
+# ---------------------------------------------------------------------------
+
+class UCPResponseCapabilityVersion(BaseModel):
+    version: str = "2026-04-08"
+
+
+class UCPResponseEnvelope(BaseModel):
+    """The `ucp` block that MUST appear in every merchant response."""
+    version: str = "2026-04-08"
+    capabilities: dict[str, list[UCPResponseCapabilityVersion]]
+    status: str = "ok"
+
+
+# ---------------------------------------------------------------------------
+# Catalog
+# ---------------------------------------------------------------------------
+
 class Product(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
@@ -30,7 +80,6 @@ class Product(BaseModel):
     currency: str = "USD"
     available: bool = True
     category: str
-    image_url: str = ""
 
 
 class CatalogSearchRequest(BaseModel):
@@ -39,43 +88,72 @@ class CatalogSearchRequest(BaseModel):
 
 
 class CatalogSearchResponse(BaseModel):
+    ucp: UCPResponseEnvelope
     products: list[Product]
     total: int
 
 
-# ── Cart ───────────────────────────────────────────────────────
-class CartItem(BaseModel):
+# ---------------------------------------------------------------------------
+# Cart  (dev.ucp.shopping.cart)
+# Ref: https://ucp.dev/2026-04-08/specification/cart
+# ---------------------------------------------------------------------------
+
+class LineItem(BaseModel):
+    """UCP spec uses 'line_items', not 'items'."""
     product_id: str
     product_name: str
     quantity: int = 1
-    unit_price_usd: float
+    unit_amount: int  # minor units (cents), per spec: "Amounts format: Minor units"
+    total_amount: int
 
 
 class CreateCartRequest(BaseModel):
-    items: list[CartItem]
+    line_items: list[dict[str, Any]]  # [{ product_id, quantity }]
     buyer_agent_id: str
 
 
-class CartResponse(BaseModel):
-    cart_id: str
-    items: list[CartItem]
-    subtotal_usd: float
-    tax_usd: float
-    total_usd: float
+class CartTotals(BaseModel):
+    subtotal: int   # cents
+    tax: int
+    total: int
     currency: str = "USD"
 
 
-# ── Checkout ───────────────────────────────────────────────────
-class CheckoutRequest(BaseModel):
+class CartResponse(BaseModel):
+    ucp: UCPResponseEnvelope
+    id: str  # spec uses `id` not `cart_id`
+    line_items: list[LineItem]
+    totals: CartTotals
+
+
+# ---------------------------------------------------------------------------
+# Checkout  (dev.ucp.shopping.checkout)
+# Ref: https://ucp.dev/2026-04-08/specification/checkout
+# ---------------------------------------------------------------------------
+
+class AP2MandatePayload(BaseModel):
+    """Container for AP2 Verifiable Credentials in the checkout request."""
+    intent_mandate: dict[str, Any]
+    cart_mandate: dict[str, Any]
+
+
+class CreateCheckoutSessionRequest(BaseModel):
+    """
+    POST /checkout-sessions
+
+    Includes the AP2 mandates under the dev.ucp.shopping.ap2_mandate extension.
+    The UCP-Agent header (RFC 8941) must be set by the client — enforced in server.py.
+    """
     cart_id: str
-    intent_mandate: dict[str, Any]  # AP2 Intent Mandate VC
-    cart_mandate: dict[str, Any]    # AP2 Cart Mandate VC
+    ap2: AP2MandatePayload | None = None  # required if ap2_mandate capability is active
     payment_token: str = "mock-payment-token"
 
 
-class OrderResponse(BaseModel):
-    order_id: str
-    status: str  # "confirmed" | "pending" | "failed"
+class CheckoutSessionResponse(BaseModel):
+    ucp: UCPResponseEnvelope
+    id: str          # checkout session id
+    status: str      # "completed" | "pending" | "failed"
     cart_id: str
-    total_usd: float
+    total_amount: int  # cents
+    currency: str = "USD"
     message: str
