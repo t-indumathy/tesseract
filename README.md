@@ -13,6 +13,9 @@ Built on the official AP2 sample role pattern
 
 ## Architecture
 
+
+![Tesseract UCP + AP2 Architecture](docs/architecture.jpg)
+
 ```
  Shopping Agent (buyer)
         │
