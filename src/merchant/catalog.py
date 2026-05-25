@@ -1,59 +1,66 @@
-"""Mock product catalog for the UCP merchant server."""
-from src.merchant.models import Product
+# Copyright 2025 Google LLC  (Apache-2.0)
+# Adapted from: google-agentic-commerce/AP2 — code/samples/python/src/roles/merchant_agent
+"""Mock product catalog used by the Tesseract merchant agent."""
+from __future__ import annotations
 
-MOCK_CATALOG: list[Product] = [
-    Product(
-        id="prod-001",
-        name="Wireless Noise-Cancelling Headphones",
-        description="Premium over-ear headphones with 30hr battery and ANC.",
-        price_usd=149.99,
-        category="Electronics",
-    ),
-    Product(
-        id="prod-002",
-        name="Mechanical Keyboard (TKL)",
-        description="Tenkeyless mechanical keyboard, Cherry MX Brown switches.",
-        price_usd=89.99,
-        category="Electronics",
-    ),
-    Product(
-        id="prod-003",
-        name="Ergonomic Standing Desk Mat",
-        description="Anti-fatigue mat, 3/4 inch thick, 30x20 inches.",
-        price_usd=39.99,
-        category="Office",
-    ),
-    Product(
-        id="prod-004",
-        name="USB-C 100W GaN Charger",
-        description="4-port GaN charger, 100W total output, travel-friendly.",
-        price_usd=49.99,
-        category="Electronics",
-    ),
-    Product(
-        id="prod-005",
-        name="Bamboo Desk Organiser",
-        description="Sustainable bamboo organiser with 6 compartments.",
-        price_usd=29.99,
-        category="Office",
-    ),
-]
+# Each entry maps product_id → cart-storage dict that mirrors what
+# merchant_agent/storage.py keeps: { amount, currency, item_label }.
+# We extend it with display metadata (description, category) for the
+# shopping-agent's search results.
+
+CATALOG: dict[str, dict] = {
+    "prod-001": {
+        "item_label": "Wireless Noise-Cancelling Headphones",
+        "description": "Premium over-ear ANC headphones, 30 hr battery.",
+        "category": "Electronics",
+        "amount": 149.99,
+        "currency": "USD",
+    },
+    "prod-002": {
+        "item_label": "Mechanical Keyboard (TKL)",
+        "description": "Tenkeyless, Cherry MX Brown switches.",
+        "category": "Electronics",
+        "amount": 89.99,
+        "currency": "USD",
+    },
+    "prod-003": {
+        "item_label": "Ergonomic Standing Desk Mat",
+        "description": "Anti-fatigue mat, 3/4 inch thick, 30x20 in.",
+        "category": "Office",
+        "amount": 39.99,
+        "currency": "USD",
+    },
+    "prod-004": {
+        "item_label": "USB-C 100W GaN Charger",
+        "description": "4-port GaN, 100 W total, travel-friendly.",
+        "category": "Electronics",
+        "amount": 49.99,
+        "currency": "USD",
+    },
+    "prod-005": {
+        "item_label": "Bamboo Desk Organiser",
+        "description": "Sustainable bamboo, 6 compartments.",
+        "category": "Office",
+        "amount": 29.99,
+        "currency": "USD",
+    },
+}
 
 
-def search_products(query: str, max_results: int = 5) -> list[Product]:
-    """Simple keyword search over the mock catalog."""
-    query_lower = query.lower()
-    matched = [
-        p for p in MOCK_CATALOG
-        if query_lower in p.name.lower()
-        or query_lower in p.description.lower()
-        or query_lower in p.category.lower()
+def search(query: str, max_results: int = 5) -> list[dict]:
+    """Keyword search over the catalog. Returns list of product dicts."""
+    q = query.lower()
+    hits = [
+        {"product_id": pid, **data}
+        for pid, data in CATALOG.items()
+        if q in data["item_label"].lower()
+        or q in data["description"].lower()
+        or q in data["category"].lower()
     ]
-    # If no match, return all (demo convenience)
-    if not matched:
-        matched = MOCK_CATALOG
-    return matched[:max_results]
+    return (hits or list({"product_id": pid, **d} for pid, d in CATALOG.items()))[:max_results]
 
 
-def get_product(product_id: str) -> Product | None:
-    return next((p for p in MOCK_CATALOG if p.id == product_id), None)
+def get(product_id: str) -> dict | None:
+    """Fetch a single product by id."""
+    data = CATALOG.get(product_id)
+    return {"product_id": product_id, **data} if data else None
