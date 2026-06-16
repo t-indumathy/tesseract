@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Treasury Intelligence Platform — LLD Design Doc</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:0 auto;padding:32px 24px;line-height:1.65;color:#1f2937;background:#fff}
+h1{font-size:2rem;color:#111827;margin-bottom:4px}
+h2{font-size:1.35rem;color:#1d4ed8;border-bottom:2px solid #e5e7eb;padding-bottom:6px;margin-top:36px}
+h3{font-size:1.1rem;color:#374151;margin-top:24px}
+p{margin:10px 0}
+pre{background:#1e293b;color:#e2e8f0;padding:20px;border-radius:10px;overflow:auto;font-size:.85rem;line-height:1.55}
+code{background:#f1f5f9;padding:2px 6px;border-radius:4px;font-size:.9rem}
+table{border-collapse:collapse;width:100%;margin:14px 0}
+th,td{border:1px solid #e5e7eb;padding:9px 13px;text-align:left;vertical-align:top}
+th{background:#f9fafb;color:#374151;font-weight:600}
+.badge{display:inline-block;background:#dbeafe;color:#1d4ed8;border-radius:4px;padding:2px 8px;font-size:.82rem;font-weight:600}
+.imgwrap{margin:24px 0}
+.imgwrap img{width:100%;border:1px solid #e5e7eb;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.07)}
+.caption{font-size:.9rem;color:#6b7280;margin-top:8px;font-style:italic}
+.toc li{margin-bottom:4px}
+.toc a{color:#2563eb;text-decoration:none}
+.section{margin-bottom:40px}
+</style>
+</head>
+<body>
+<h1>Enterprise Treasury Intelligence Platform</h1>
+<p><span class="badge">LLD v2.0</span>&nbsp;&nbsp;<span style="color:#6b7280">June 2026 — Internal Engineering</span></p>
+<p>This document specifies the complete low-level technical design for a dual-lane treasury intelligence platform. It ingests BAI2/EDI files, PDFs, CSVs, and intraday Kafka feeds; extracts structured financial data; computes bond and treasury analytics; persists across a hybrid storage tier; and serves a commercial AI chatbot answering 60+ query types with a <strong>15-second SLA</strong> and <strong>100% numerical accuracy guarantee</strong>.</p>
+
+<section class="section">
+<h2 id="toc">Contents</h2>
+<ol class="toc">
+<li><a href="#overview">System Overview</a></li>
+<li><a href="#architecture">6-Plane Architecture</a></li>
+<li><a href="#ingestion">Ingestion &amp; Extraction Pipeline</a></li>
+<li><a href="#storage">Storage Layer</a></li>
+<li><a href="#query">Query Routing &amp; NL2SQL Engine</a></li>
+<li><a href="#rag">RAG Retrieval Layer</a></li>
+<li><a href="#calc">Bond Calculation Engine</a></li>
+<li><a href="#accuracy">Numerical Accuracy Guarantee</a></li>
+<li><a href="#sla">Latency Budget &amp; SLA</a></li>
+<li><a href="#security">Security Architecture</a></li>
+<li><a href="#infra">Kubernetes Infrastructure</a></li>
+<li><a href="#observability">Observability</a></li>
+<li><a href="#stack">Technology Stack</a></li>
+<li><a href="#diagrams">Appendix — Architecture &amp; Sequence Diagrams</a></li>
+</ol>
+</section>
+
+<section class="section" id="overview">
+<h2>1. System Overview</h2>
+<p>The platform processes enterprise treasury documents and serves a conversational AI interface over the resulting structured data. 70% of queries are answered via deterministic NL2SQL + indexed PostgreSQL, 20% via hybrid RAG, and 10% via the bond calculation engine. The LLM is used only for language generation, never for arithmetic.</p>
+<table>
+<tr><th>Capability</th><th>Detail</th></tr>
+<tr><td>Document formats</td><td>BAI2, EDI 820/822/823, CSV/XLSX, scanned PDF, image</td></tr>
+<tr><td>Report types</td><td>11 bank report types: balance, lockbox, controlled disbursement, zero-balance, EDI remittance, wire confirmation, ACH detail, return, fee, sweep, intraday</td></tr>
+<tr><td>Query types</td><td>60+ covering balances, cashflow, wire, ACH, lockbox, fees, returns, bond positions, YTM, duration, DV01, cross-account, trend charts</td></tr>
+<tr><td>SLA</td><td>P50 &le;5 s, P95 &le;15 s end-to-end</td></tr>
+<tr><td>Accuracy</td><td>4-layer numerical verification — 0% hallucinated figures</td></tr>
+<tr><td>Intraday refresh</td><td>Balance updates within 3 s of Kafka feed arrival</td></tr>
+</table>
+</section>
+
+<section class="section" id="architecture">
+<h2>2. 6-Plane Architecture</h2>
+<p>Each plane has a single responsibility and a well-defined interface to adjacent planes. Arrows flow upward from raw data to user response.</p>
+<table>
+<tr><th>Plane</th><th>Responsibility</th><th>Key Latency Target</th></tr>
+<tr><td><strong>Ingestion</strong></td><td>Classify, parse, OCR raw files</td><td>Async — no user SLA</td></tr>
+<tr><td><strong>Processing</strong></td><td>Entity extraction, vendor resolution, bond math</td><td>Async — no user SLA</td></tr>
+<tr><td><strong>Storage</strong></td><td>Persist structured facts, vectors, blobs</td><td>Write &lt;100 ms</td></tr>
+<tr><td><strong>Query</strong></td><td>Route intent, NL2SQL or RAG retrieval</td><td>&lt;1.5 s NL2SQL, &lt;500 ms retrieval</td></tr>
+<tr><td><strong>Generation</strong></td><td>Context assembly, vLLM generation, verification</td><td>&lt;13 s</td></tr>
+<tr><td><strong>API</strong></td><td>Auth, REST/WebSocket, chart rendering</td><td>&lt;200 ms overhead</td></tr>
+</table>
+</section>
+
+<section class="section" id="ingestion">
+<h2>3. Ingestion &amp; Extraction Pipeline</h2>
+<h3>3.1 Document Classifier</h3>
+<p>Every uploaded file is routed before any parsing begins using MIME detection and content-level header matching (BAI2 record type 01, EDI ISA* header).</p>
+<h3>3.2 BAI2 Structured Parser</h3>
+<p>Parses all BAI2 record codes (01/02/03/16/49/98/99). Normalises amounts from cents to dollars. Maps 100+ type codes to semantic categories: wire_in, wire_out, ach_receive, ach_origination, lockbox, check, fee, return, credit, debit. Determines settlement status from the funds_type field.</p>
+<h3>3.3 PDF/Image Lane — OCR + NER</h3>
+<p>Uses Unstructured.io with YOLOX layout detection for high-fidelity table extraction from bond statements and bank reports. LayoutLMv3 fine-tuned model extracts bond entities (ISIN, coupon rate, maturity, settlement price, accrued interest).</p>
+<h3>3.4 Vendor Entity Resolver</h3>
+<p>Resolves noisy BAI2 description fields (ACH credit strings, SWIFT BNF/ORG fields, lockbox IDs) against the ERP vendor master using rapidfuzz token_set_ratio with an 82-point threshold and four regex patterns.</p>
+<h3>3.5 Celery Async Pipeline</h3>
+<p>Structured lane: parse → vendor resolve → validate → cache invalidate. Unstructured lane: OCR → NER → bond calc → validate → embed + index. Both lanes use Celery task chains with max_retries=3 and 300-second time limits.</p>
+</section>
+
+<section class="section" id="storage">
+<h2>4. Storage Layer</h2>
+<h3>4.1 PostgreSQL Schema</h3>
+<p>Core tables: bank_accounts, account_balances, transactions, bonds, bond_positions. Two materialized views refresh on ingestion completion: daily_account_summary (credits, debits, wire counts, pending counts) and portfolio_summary (DV01, duration, market value). Key composite indexes on (account_id, as_of_date), (as_of_date, type_category), amount DESC, vendor_customer, and settlement_type.</p>
+<h3>4.2 Qdrant Vector Store</h3>
+<p>Collection treasury_docs with dual vectors: dense (BGE-M3, 1024-dim, cosine) and sparse (BM25 via fastembed). HNSW m=32, ef_construct=200. Payload indexes on portfolio_id, isin, account_id, doc_type, as_of_date for pre-filtering before vector search.</p>
+<h3>4.3 Redis Layered Cache</h3>
+<p>L1 in-process LRU (1024 entries, microseconds) for hot embeddings. L2 Redis Sentinel with per-prefix TTLs: SQL results 300 s, balance 60 s, embeddings 3600 s. Cache keys are SHA-256 hashes of the normalised query payload. On ingestion completion, account-scoped cache keys are invalidated.</p>
+</section>
+
+<section class="section" id="query">
+<h2>5. Query Routing &amp; NL2SQL Engine</h2>
+<h3>5.1 Intent Router</h3>
+<p>First attempts regex-based template matching against 30 known patterns. Template-matched queries bypass the NL2SQL LLM entirely and execute pre-compiled parameterised SQL in under 50 ms. Unknown queries are classified by the LLM into 13 intents and routed to the appropriate path.</p>
+<h3>5.2 NL2SQL Engine</h3>
+<p>Novel queries go to Qwen2.5-Coder-7B-Instruct via vLLM with a 3-second hard timeout. The system prompt constrains the model to the exact schema and forbids mutating statements. A safety regex blocks DROP, DELETE, UPDATE, INSERT, TRUNCATE, ALTER, CREATE, GRANT, EXEC. sqlparse validates output before execution.</p>
+<h3>5.3 Query Path Split</h3>
+<table>
+<tr><th>Intent</th><th>Path</th><th>P50</th></tr>
+<tr><td>Balance, aggregation, filter, chart (70%)</td><td>Template SQL or NL2SQL + PostgreSQL</td><td>50–800 ms</td></tr>
+<tr><td>Document search, explanation (20%)</td><td>Hybrid RAG + LLM</td><td>5–10 s</td></tr>
+<tr><td>YTM, DV01, duration, convexity (10%)</td><td>Bond Calculator + LLM</td><td>3–8 s</td></tr>
+</table>
+</section>
+
+<section class="section" id="rag">
+<h2>6. RAG Retrieval Layer</h2>
+<p>Hybrid retrieval fuses dense (BGE-M3 cosine) and sparse (BM25) results via Reciprocal Rank Fusion in Qdrant. The top-20 candidates are re-ranked by a CrossEncoder (ms-marco-MiniLM-L-6-v2) to return the best 6 chunks. Payload filters restrict retrieval to the relevant portfolio, account, or document type before vector search executes, keeping latency under 500 ms.</p>
+</section>
+
+<section class="section" id="calc">
+<h2>7. Bond Calculation Engine</h2>
+<p>All treasury math is deterministic Python (scipy + numpy). The LLM never computes these values — it only formats and narrates them.</p>
+<table>
+<tr><th>Metric</th><th>Method</th></tr>
+<tr><td>YTM</td><td>scipy.optimize.brentq on discounted cashflow equation</td></tr>
+<tr><td>Modified Duration</td><td>Macaulay duration / (1 + ytm/freq)</td></tr>
+<tr><td>DV01</td><td>modified_duration × dirty_price / 10,000</td></tr>
+<tr><td>Accrued Interest</td><td>Day-count fraction × coupon</td></tr>
+<tr><td>Convexity</td><td>Second-order price sensitivity via finite difference</td></tr>
+</table>
+</section>
+
+<section class="section" id="accuracy">
+<h2>8. Numerical Accuracy Guarantee — 4-Layer Defence</h2>
+<ol>
+<li><strong>SQL-first:</strong> All figures are pre-computed by PostgreSQL or BondCalculator and injected as literals into the prompt.</li>
+<li><strong>Structured output:</strong> The LLM returns Pydantic InsightResponse with each claim tagged by source (database / calc_engine / llm_inferred).</li>
+<li><strong>Numerical Verifier:</strong> Any llm_inferred figure is auto-corrected from the ground-truth dict. Relative error &gt;0.01% triggers a correction and increments a Prometheus counter.</li>
+<li><strong>temperature=0.0:</strong> All financial generation calls use deterministic sampling.</li>
+</ol>
+</section>
+
+<section class="section" id="sla">
+<h2>9. Latency Budget &amp; SLA</h2>
+<table>
+<tr><th>Query Type</th><th>P50</th><th>P95</th><th>Hard SLA</th></tr>
+<tr><td>Template SQL — cache HIT</td><td>5 ms</td><td>20 ms</td><td>15 s</td></tr>
+<tr><td>Template SQL — cache MISS</td><td>300 ms</td><td>600 ms</td><td>15 s</td></tr>
+<tr><td>NL2SQL — Coder-7B</td><td>2.5 s</td><td>4.5 s</td><td>15 s</td></tr>
+<tr><td>Chart generation</td><td>3.0 s</td><td>5.5 s</td><td>15 s</td></tr>
+<tr><td>RAG document search</td><td>5.0 s</td><td>10 s</td><td>15 s</td></tr>
+<tr><td>Bond calc + RAG</td><td>8.0 s</td><td>13.5 s</td><td>15 s</td></tr>
+<tr><td>Intraday balance refresh</td><td>—</td><td>&lt;3 s</td><td>3 s data freshness</td></tr>
+</table>
+</section>
+
+<section class="section" id="security">
+<h2>10. Security Architecture</h2>
+<table>
+<tr><th>Control</th><th>Implementation</th></tr>
+<tr><td>Authentication</td><td>OIDC (Keycloak / Azure AD) + JWT bearer tokens</td></tr>
+<tr><td>Service-to-service</td><td>mTLS via SPIFFE/SPIRE on all inter-service calls</td></tr>
+<tr><td>Encryption at rest</td><td>PostgreSQL column-level AES-256-GCM via pgcrypto on amount, account_id, vendor_customer</td></tr>
+<tr><td>Data residency</td><td>CONFIDENTIAL data (P&amp;L, wire counterparties) stays on local vLLM — never leaves perimeter</td></tr>
+<tr><td>SQL injection</td><td>Safety regex on all NL2SQL output + parameterised queries only</td></tr>
+<tr><td>Audit trail</td><td>Immutable append-only audit_log table — every query + response hash recorded</td></tr>
+<tr><td>RBAC</td><td>treasury_analyst / risk_officer / portfolio_manager / platform_admin with scoped account access</td></tr>
+</table>
+</section>
+
+<section class="section" id="infra">
+<h2>11. Kubernetes Infrastructure</h2>
+<table>
+<tr><th>Component</th><th>Replicas</th><th>CPU</th><th>RAM</th><th>GPU</th></tr>
+<tr><td>FastAPI API Server</td><td>3–6 (HPA)</td><td>2 cores</td><td>4 GB</td><td>—</td></tr>
+<tr><td>Celery Ingestion Worker</td><td>4–8</td><td>4 cores</td><td>16 GB</td><td>1× A10G</td></tr>
+<tr><td>vLLM Qwen-72B (Generation)</td><td>2 (HA)</td><td>16 cores</td><td>80 GB</td><td>4× A100 80GB</td></tr>
+<tr><td>vLLM Coder-7B (NL2SQL)</td><td>2</td><td>4 cores</td><td>24 GB</td><td>1× A10G</td></tr>
+<tr><td>Qdrant VDB Cluster</td><td>3</td><td>8 cores</td><td>32 GB</td><td>—</td></tr>
+<tr><td>PostgreSQL Primary + Replica</td><td>2</td><td>8 cores</td><td>32 GB</td><td>—</td></tr>
+<tr><td>Redis Sentinel</td><td>3</td><td>2 cores</td><td>4 GB</td><td>—</td></tr>
+<tr><td>Kafka Brokers</td><td>3</td><td>4 cores</td><td>8 GB</td><td>—</td></tr>
+</table>
+</section>
+
+<section class="section" id="observability">
+<h2>12. Observability</h2>
+<p>OpenTelemetry traces every ingestion and query path end-to-end. Prometheus counters and histograms track: documents ingested by route and status, OCR latency, NL2SQL latency by path (template vs LLM), SQL execution latency by query type, LLM token counts and generation latency, SLA breach count, cache hit rate by prefix, verifier corrections by field, and active chatbot sessions. Grafana dashboards surface system health and data accuracy in a single view.</p>
+</section>
+
+<section class="section" id="stack">
+<h2>13. Technology Stack</h2>
+<table>
+<tr><th>Layer</th><th>Technology</th></tr>
+<tr><td>API</td><td>FastAPI 0.115 + Python 3.12, WebSocket streaming</td></tr>
+<tr><td>Task queue</td><td>Celery + Redis broker / Kafka for intraday</td></tr>
+<tr><td>OCR (native PDF)</td><td>PyMuPDF, pdfminer.six</td></tr>
+<tr><td>OCR (scanned)</td><td>Tesseract 5 + OpenCV + Unstructured.io + YOLOX</td></tr>
+<tr><td>NER model</td><td>LayoutLMv3 (fine-tuned for bond entities)</td></tr>
+<tr><td>BAI2 parser</td><td>Custom Python (all record codes, all funds types)</td></tr>
+<tr><td>Vendor resolution</td><td>rapidfuzz token_set_ratio, threshold 82</td></tr>
+<tr><td>Bond math</td><td>scipy.optimize.brentq + numpy</td></tr>
+<tr><td>Dense embeddings</td><td>BAAI/bge-m3 via SentenceTransformers (CUDA)</td></tr>
+<tr><td>Sparse retrieval</td><td>fastembed BM25 + Qdrant sparse vectors</td></tr>
+<tr><td>Vector DB</td><td>Qdrant cluster, gRPC, HNSW m=32</td></tr>
+<tr><td>Re-ranker</td><td>CrossEncoder ms-marco-MiniLM-L-6-v2</td></tr>
+<tr><td>NL2SQL LLM</td><td>Qwen2.5-Coder-7B-Instruct via vLLM</td></tr>
+<tr><td>Generation LLM</td><td>Qwen2.5-72B-Instruct via vLLM (FP8 + EAGLE)</td></tr>
+<tr><td>Structured DB</td><td>PostgreSQL 16 + pgcrypto</td></tr>
+<tr><td>Cache</td><td>Redis 7 Sentinel + in-process LRU</td></tr>
+<tr><td>Blob storage</td><td>S3 / GCS</td></tr>
+<tr><td>Charts</td><td>Plotly server-side PNG, base64</td></tr>
+<tr><td>Auth</td><td>Keycloak OIDC + SPIFFE/SPIRE mTLS</td></tr>
+<tr><td>Orchestration</td><td>Kubernetes (OpenShift) + Helm</td></tr>
+<tr><td>Observability</td><td>OpenTelemetry + Prometheus + Grafana</td></tr>
+<tr><td>CI/CD</td><td>GitHub Actions &rarr; Helm &rarr; OCP</td></tr>
+</table>
+</section>
+
+<section class="section" id="diagrams">
+<h2>14. Appendix — Architecture &amp; Sequence Diagrams</h2>
+<div class="imgwrap"><img src="./assets/diagram_architecture.png" alt="Fig 1 — 6-Plane Layered Architecture"><p class="caption">Fig 1 — Treasury Intelligence Platform: 6-Plane Layered Architecture</p></div>
+<div class="imgwrap"><img src="./assets/diagram_ingestion.png" alt="Fig 2 — Document Ingestion Pipeline"><p class="caption">Fig 2 — Document Ingestion &amp; Extraction Pipeline: Dual-Lane Flow</p></div>
+<div class="imgwrap"><img src="./assets/diagram_dataflow.png" alt="Fig 3 — Data Flow to Storage"><p class="caption">Fig 3 — Data Flow: Ingestion to Storage Schema Mapping</p></div>
+<div class="imgwrap"><img src="./assets/diagram_query_sequence.png" alt="Fig 4 — Chatbot Query Sequence"><p class="caption">Fig 4 — Chatbot Query Sequence: Three Routing Paths</p></div>
+<div class="imgwrap"><img src="./assets/diagram_latency.png" alt="Fig 5 — Latency Budget"><p class="caption">Fig 5 — Per-Stage Latency Budget: P50 vs P95 (log scale, 15 s SLA)</p></div>
+</section>
+
+</body>
+</html>
