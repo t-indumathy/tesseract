@@ -3,14 +3,57 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tesseract</title>
-    <script>
-        // Redirect to the main documentation
-        window.location.href = './treasury_intelligence_lld.html';
-    </script>
+    <title>Tesseract Documentation</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+        }
+        .docs-section {
+            margin: 30px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: #f9f9f9;
+        }
+        .docs-section h2 {
+            margin-top: 0;
+            color: #0366d6;
+        }
+        .docs-section a {
+            display: inline-block;
+            padding: 10px 20px;
+            margin-top: 10px;
+            background-color: #0366d6;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+        }
+        .docs-section a:hover {
+            background-color: #0256c0;
+        }
+    </style>
 </head>
 <body>
-    <p>Redirecting to documentation...</p>
-    <p>If you are not redirected, <a href="./treasury_intelligence_lld.html">click here</a>.</p>
+    <h1>Tesseract Documentation</h1>
+    <p>Welcome to the Tesseract project documentation. Select a document below:</p>
+    
+    <div class="docs-section">
+        <h2>KYA LLD</h2>
+        <p>KYA (Know Your Account) Low-Level Design documentation.</p>
+        <a href="./kya_lld.html">View KYA LLD</a>
+    </div>
+
+    <div class="docs-section">
+        <h2>Treasury Intelligence LLD</h2>
+        <p>Treasury Intelligence Low-Level Design documentation.</p>
+        <a href="./treasury_intelligence_lld.html">View Treasury Intelligence LLD</a>
+    </div>
 </body>
 </html>
